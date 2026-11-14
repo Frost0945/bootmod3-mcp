@@ -13,6 +13,7 @@ the whole thing.
 - `src/compare.ts` — pure comparison logic, no I/O. Exists separately so it is testable.
 - `src/datalog.ts` — pure CSV parsing, channel resolution, highlight (de)serialization.
 - `src/tree.ts` — the tabletree payload types plus `flattenNodes` / `buildTreeText`.
+- `src/safety.ts` — pure tune and datalog safety assessment and the limits profile. `save_tables` calls it before every write and refuses on warning/critical findings unless `acknowledgeRisks` is set. Don't weaken that gate or set `acknowledgeRisks` without the user's explicit go-ahead.
 - `src/*.test.ts` — `node:test`, 117 tests with a populated map cache, plus 5
   real-datalog invariants that run only when `cache/datalogs` is populated.
   Run `npm test` for the current count rather than trusting this line.

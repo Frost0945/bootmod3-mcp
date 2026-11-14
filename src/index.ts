@@ -18,6 +18,7 @@ import {
   type ParsedDatalog,
 } from "./datalog.js";
 import { buildTreeText, flattenNodes, type TableTreeResponse } from "./tree.js";
+import { DEFAULT_PROFILE, assessDatalog, assessTune, mergeProfile, type SafetyProfile, type TuneSafetyReport } from "./safety.js";
 
 const BASE_URL = "https://www.bootmod3.net";
 const TOKEN = process.env.BOOTMOD3_token;           // localStorage "token" → Authorization header
@@ -33,6 +34,24 @@ if (!ACCESS_TOKEN) {
 }
 
 const DEBUG = process.env.BOOTMOD3_DEBUG === "1";
+
+// Safety limits default to the N20 / 91 octane / stock-turbo profile. A JSON file
+// of overrides (same shape as SafetyProfile, any subset of keys) can tune them.
+function loadSafetyProfile(): SafetyProfile {
+  const file = process.env.BOOTMOD3_SAFETY_PROFILE;
+  if (!file) return DEFAULT_PROFILE;
+  try {
+    const profile = mergeProfile(JSON.parse(fs.readFileSync(file, "utf8")));
+    process.stderr.write(`[bootmod3] safety profile: ${profile.name}\n`);
+    return profile;
+  } catch (e) {
+    // Fail closed: a typo in the override file must not silently disable the limits
+    // someone thought they had set, so refuse to start rather than fall back.
+    process.stderr.write(`[bootmod3] could not read BOOTMOD3_SAFETY_PROFILE (${file}): ${e}\n`);
+    process.exit(1);
+  }
+}
+const SAFETY_PROFILE = loadSafetyProfile();
 
 // Per-mapId in-memory cache — invalidated on save
 const treeCache = new Map<string, TableTreeResponse>();
@@ -237,15 +256,49 @@ function writeHighlights(id: string, highlights: DatalogHighlight[]): void {
 
 const server = new McpServer({ name: "bootmod3", version: "1.0.0" });
 
+async function fetchMapList(): Promise<Array<Record<string, unknown>>> {
+  const res = await apiFetch(`${BASE_URL}/editor/maps`, { headers: baseHeaders });
+  if (!res.ok) throw new Error(`list_maps ${res.status}: ${await res.text()}`);
+  return (await res.json()) as Array<Record<string, unknown>>;
+}
+
+/**
+ * Picks the map that changes are judged against. An explicit id wins; otherwise
+ * the stock map for the same engine/ROM, because safety is about how far a tune
+ * has moved from factory — judging only against the previous save would let a
+ * tune creep upward in small, individually harmless steps.
+ */
+async function resolveReference(
+  target: TableTreeResponse,
+  referenceMapId?: string
+): Promise<{ tree: TableTreeResponse; note: string } | null> {
+  if (referenceMapId) {
+    return { tree: await fetchTableTree(referenceMapId), note: `reference: map ${referenceMapId} (chosen explicitly)` };
+  }
+  const maps = await fetchMapList();
+  const stock = maps.filter((m) => m.stock === true && m.id !== target.mapId);
+  const exact = stock.find((m) => m.engineType === target.engineType);
+  const family = stock.find(
+    (m) => typeof m.engineType === "string" && m.engineType.slice(0, 3) === (target.engineType ?? "").slice(0, 3)
+  );
+  const pick = exact ?? family;
+  if (!pick) return null;
+  return {
+    tree: await fetchTableTree(pick.id as string),
+    note: `reference: stock map "${pick.name}" (${pick.id}, ${pick.engineType})${exact ? "" : " — a different ROM of the same engine; tables are matched across ROMs"}`,
+  };
+}
+
+function blockingFindings(report: TuneSafetyReport) {
+  return report.findings.filter((f) => f.severity !== "info");
+}
+
 server.tool(
   "list_maps",
   "List all available ECU maps for your BMW. Returns id, name, description, engine type, stock flag, and tuner info.",
   {},
   async () => {
-    const res = await apiFetch(`${BASE_URL}/editor/maps`, { headers: baseHeaders });
-    if (!res.ok) throw new Error(`list_maps ${res.status}: ${await res.text()}`);
-
-    const maps = (await res.json()) as Array<Record<string, unknown>>;
+    const maps = await fetchMapList();
     const summary = maps.map((m) => ({
       id: m.id,
       name: m.name,
@@ -362,7 +415,7 @@ server.tool(
 
 server.tool(
   "save_tables",
-  "Save modified values for one or more ECU tables in a map. Only changed tables need to be included — others are unaffected.",
+  "Save modified values for one or more ECU tables in a map. Only changed tables need to be included — others are unaffected. THIS WRITES TO A REAL CAR'S TUNE. Every save first runs the same safety check as check_tune_safety on the tables being saved, judged against the stock map: if anything is at warning or critical level the save is REFUSED and the findings are returned instead. Show those findings to the user; only pass acknowledgeRisks=true after the user has read them and explicitly said to save anyway. Use dryRun=true to check without saving.",
   {
     mapId: z.string().describe("Map ID from list_maps"),
     mapName: z.string().describe("Map name (from list_maps, required by API)"),
@@ -386,8 +439,62 @@ server.tool(
         })
       )
       .describe("Tables to update"),
+    referenceMapId: z
+      .string()
+      .optional()
+      .describe("Map to judge the changes against. Default: the stock map for the same engine from list_maps"),
+    dryRun: z.boolean().default(false).describe("Run the safety check and report, but don't save"),
+    acknowledgeRisks: z
+      .boolean()
+      .default(false)
+      .describe(
+        "Save despite warning/critical safety findings. Only set this after showing the user the findings and getting their explicit go-ahead in this conversation"
+      ),
   },
-  async ({ mapId, mapName, mapDesc, mapVersion, tables }) => {
+  async ({ mapId, mapName, mapDesc, mapVersion, tables, referenceMapId, dryRun, acknowledgeRisks }) => {
+    // --- Safety gate -------------------------------------------------------
+    // Build the map as it would look after the save, then judge only the tables
+    // being written. Definitions (bounds, axis names) come from the current map.
+    const current = await fetchTableTree(mapId);
+    const proposedData: TableTreeResponse["tableData"] = {};
+    for (const t of tables) {
+      const existing = current.tableData[t.extId];
+      if (!existing) throw new Error(`Table "${t.extId}" not found in map ${mapId}; nothing was saved`);
+      proposedData[t.extId] = {
+        ...existing,
+        rows: t.rows,
+        hAxis: t.hAxis ?? existing.hAxis,
+        vAxis: t.vAxis ?? existing.vAxis,
+      };
+    }
+    const proposed: TableTreeResponse = { ...current, tableData: { ...current.tableData, ...proposedData } };
+
+    const reference = await resolveReference(current, referenceMapId);
+    const report = assessTune(reference?.tree ?? current, proposed, {
+      profile: SAFETY_PROFILE,
+      onlyExtIds: tables.map((t) => t.extId),
+      engineType: current.engineType,
+    });
+    const referenceNote =
+      reference?.note ??
+      "reference: no stock map found on the account, so changes are judged against the map's current values only — cumulative changes from stock can't be checked";
+    const blocking = blockingFindings(report);
+    const safety = { referenceNote, ...report };
+
+    if (dryRun) {
+      return { content: [{ type: "text", text: `DRY RUN — nothing saved.\n\n${JSON.stringify(safety, null, 2)}` }] };
+    }
+    if (blocking.length && !acknowledgeRisks) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `NOT SAVED — the safety check found ${blocking.length} issue(s) (verdict ${report.verdict}). Show these to the user. Retry with acknowledgeRisks=true only if they explicitly choose to save anyway.\n\n${JSON.stringify(safety, null, 2)}`,
+          },
+        ],
+      };
+    }
+
     const tableData: Record<string, unknown> = {};
     for (const t of tables) {
       tableData[t.extId] = {
@@ -443,7 +550,10 @@ server.tool(
       content: [
         {
           type: "text",
-          text: `Saved. Map: ${result.name} (${result.id}) | saveId: ${result.saveId} | uDate: ${result.uDate}`,
+          text:
+            `Saved. Map: ${result.name} (${result.id}) | saveId: ${result.saveId} | uDate: ${result.uDate}\n` +
+            `Safety verdict: ${report.verdict}${blocking.length ? ` — saved with ${blocking.length} acknowledged issue(s)` : ""}. ${report.summary}\n` +
+            `Log a full-throttle pull and run check_datalog_health before driving hard on it.`,
         },
       ],
     };
@@ -623,6 +733,55 @@ server.tool(
     }
 
     return { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] };
+  }
+);
+
+server.tool(
+  "check_tune_safety",
+  `Check a map for risky changes compared with the stock map, using conservative limits for: ${SAFETY_PROFILE.name}. Flags extra ignition timing, leaner fuelling, higher boost or load limits, any change to knock-control, rev-limit or engine-protection tables, out-of-range values and likely typos. Returns a verdict (OK / REVIEW / UNSAFE), findings with the RPM/load where each problem is worst, and changed tables it couldn't categorize. These are rules of thumb, not a tuner's sign-off — say so when presenting results.`,
+  {
+    mapId: z.string().describe("Map to check, from list_maps"),
+    referenceMapId: z
+      .string()
+      .optional()
+      .describe("Map to compare against. Default: the stock map for the same engine from list_maps"),
+    includeInfo: z.boolean().default(true).describe("Include info-level findings (changes that are within limits)"),
+  },
+  async ({ mapId, referenceMapId, includeInfo }) => {
+    const target = await fetchTableTree(mapId);
+    const reference = await resolveReference(target, referenceMapId);
+    if (!reference) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "No stock map for this engine was found on the account, so there is nothing to compare against. Pass referenceMapId with a known-good or stock map.",
+          },
+        ],
+      };
+    }
+    if (reference.tree.mapId === target.mapId) throw new Error("mapId and referenceMapId are the same map");
+    const report = assessTune(reference.tree, target, { profile: SAFETY_PROFILE, engineType: target.engineType });
+    const out = {
+      referenceNote: reference.note,
+      ...report,
+      findings: includeInfo ? report.findings : report.findings.filter((f) => f.severity !== "info"),
+    };
+    return { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] };
+  }
+);
+
+server.tool(
+  "check_datalog_health",
+  `Health check for a datalog: finds full-throttle pulls and reports knock/timing corrections per cylinder, lean mixture, fuel-pressure drops (high- and low-pressure pumps), boost overshoot and peak boost, intake/coolant/oil temperatures, plus performance numbers (peak boost, where boost target is reached, timing at WOT, peak load). Limits are for: ${SAFETY_PROFILE.name}. Returns verdict OK / WATCH / STOP, findings with timestamps, and which channels were or weren't logged — missing channels mean those checks didn't run, so say so.`,
+  {
+    id: z.string().describe("Datalog id from list_datalogs"),
+    refresh: z.boolean().default(false).describe("Bypass cache and re-download from server"),
+  },
+  async ({ id, refresh }) => {
+    const dl = await fetchDatalog(id, refresh);
+    const report = assessDatalog(dl, SAFETY_PROFILE);
+    return { content: [{ type: "text", text: JSON.stringify({ id, ...report }, null, 2) }] };
   }
 );
 

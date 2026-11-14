@@ -13,7 +13,7 @@ hardcoded to a ROM — but they are untested.
 
 ## Tools
 
-Fifteen tools in three groups. See `docs/tools-architecture.html` for how they fit
+Seventeen tools in four groups (two safety tools are described under [Safety checks](#safety-checks)). See `docs/tools-architecture.html` for how they fit
 together.
 
 ### Maps and tables
@@ -128,6 +128,47 @@ BOOTMOD3_token=… BOOTMOD3_access_token=… npm start
 
 It speaks MCP over stdio, so on its own it will just sit there waiting. Useful for
 checking that auth works: it prints `[bootmod3] auth OK` to stderr.
+
+## Safety checks
+
+Added on top of the original server. Limits are tuned for an **N20 on 91 octane
+with the stock turbo, intercooler and fuel system (cold-air intake only)**.
+These are conservative rules of thumb, not a tuner's sign-off.
+
+| Tool | What it does |
+|---|---|
+| `check_tune_safety` | Compares a map with the stock map and flags extra timing, leaner fuelling, higher boost/load limits, any change to knock-control, rev-limit or protection tables, out-of-range values and likely typos. Verdict: OK / REVIEW / UNSAFE |
+| `check_datalog_health` | Finds full-throttle pulls in a log and checks knock per cylinder, lean mixture, high- and low-pressure fuel, boost overshoot, peak boost and temperatures; reports peak boost, spool point, WOT timing and load. Verdict: OK / WATCH / STOP |
+
+**`save_tables` is gated.** Every save runs the tune check on the tables being
+written, judged against the stock map (so small edits on an already aggressive
+tune still add up). Anything at warning or critical level is refused with the
+findings. It only saves after you've seen them and the call is repeated with
+`acknowledgeRisks: true`. `dryRun: true` checks without saving.
+
+Default limits (all in `src/safety.ts`, `DEFAULT_PROFILE`):
+
+| Check | Warn | Stop |
+|---|---|---|
+| Timing added vs stock | +1.5° | +3° |
+| Leaner than stock | +0.02 λ | +0.04 λ |
+| Boost target vs stock | +10% | +20% |
+| Boost target, absolute (hPa tables) | 2300 hPa | 2450 hPa |
+| Load/torque limit vs stock | +10% | +25% |
+| Knock, rev-limit, protection tables | — | any change |
+| Log: timing pulled | 3° | 5° |
+| Log: lambda at WOT (sustained) | 0.88 | 0.92 |
+| Log: rail pressure vs target | 85% | 70% |
+| Log: low-pressure fuel | 4 bar | 3 bar |
+| Log: boost overshoot | 2 psi | 3.5 psi |
+| Log: peak boost | 19 psi | 21 psi |
+| Log: intake air temp | 50 °C | 65 °C |
+
+To change them without editing code, point `BOOTMOD3_SAFETY_PROFILE` at a JSON
+file with any subset of the profile's keys, e.g.
+`{"name": "N20 · 93 octane", "tune": {"ignitionWarnDeg": 2, "ignitionCritDeg": 4}}`.
+The server refuses to start if that file can't be read, so a typo never
+silently drops the limits.
 
 ## Comparing maps
 
